@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>可用架数预测 · 晚到维修工单回放</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --line: #d9dee5; --ink: #1f2933;
+    --muted: #66707d; --accent: #1d5fd1; --warn: #b45309; --bad: #b91c1c; --good: #15803d;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.55 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         background: var(--bg); color: var(--ink); }
+  header { padding: 20px 28px 12px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; }
+  main { padding: 8px 28px 40px; max-width: 1180px; }
+  .toolbar { display: flex; gap: 12px; flex-wrap: wrap; margin: 16px 0; }
+  button { border: 1px solid var(--accent); background: var(--accent); color: #fff; border-radius: 8px;
+           padding: 9px 16px; font-size: 14px; cursor: pointer; }
+  button.secondary { background: #fff; color: var(--accent); }
+  button.ghost { background: #fff; color: var(--ink); border-color: var(--line); }
+  button:disabled { opacity: .55; cursor: wait; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+          padding: 16px 18px; margin: 14px 0; }
+  .card h2 { font-size: 15px; margin: 0 0 10px; }
+  .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px 18px; }
+  .kv div { border-left: 3px solid var(--line); padding-left: 10px; }
+  .kv .k { color: var(--muted); font-size: 12px; }
+  .kv .v { font-weight: 600; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid var(--line); padding: 5px 8px; text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child, td.l { text-align: left; }
+  thead th { background: #eef2f7; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; }
+  .pill.warn { background: #fef3c7; color: var(--warn); }
+  .pill.bad { background: #fee2e2; color: var(--bad); }
+  .pill.good { background: #dcfce7; color: var(--good); }
+  .muted { color: var(--muted); }
+  .err { color: var(--bad); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+  code { background: #eef2f7; padding: 1px 5px; border-radius: 4px; }
+  .bar { position: relative; height: 16px; background: #e8eefc; border-radius: 8px; min-width: 90px; }
+  .bar i { position: absolute; top: 0; bottom: 0; background: #9dbcf3; border-radius: 8px; }
+  .bar b { position: absolute; top: -2px; width: 2px; height: 20px; background: var(--accent); }
+  .scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>机队可用架数：晚到维修工单下的区间预测与历史回放</h1>
+  <div class="sub">台账按物理停用/归还事件对齐；工单晚到只影响系统可见性。所有结果均由本地实时计算得出。</div>
+</header>
+<main>
+  <div class="toolbar">
+    <button id="btn-generate">① 生成原能力预测</button>
+    <button id="btn-backfill" class="secondary">② 补录早期停用</button>
+    <button id="btn-backtest" class="ghost">③ 查看回测和区间</button>
+  </div>
+
+  <!-- 业务结果区：操作前后内容变化可通过该属性核对 -->
+  <section id="result" data-evidence-result="empty">
+    <div class="card muted">尚未执行操作。点击上方按钮，结果将在此处渲染。</div>
+  </section>
+</main>
+
+<script>
+const resultEl = document.getElementById('result');
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+async function call(path, options = {}) {
+  const res = await fetch(path, {
+    method: options.method || 'GET',
+    headers: { 'content-type': 'application/json' },
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+  const json = await res.json();
+  if (!res.ok || !json.ok) throw new Error(`${json.error?.code ?? 'HTTP'}: ${json.error?.message ?? res.status}`);
+  return json.data;
+}
+
+function setEvidence(kind, payload) {
+  resultEl.setAttribute('data-evidence-result', kind);
+  resultEl.innerHTML = payload;
+}
+
+function kvCard(title, rows) {
+  return `<div class="card"><h2>${esc(title)}</h2><div class="kv">${
+    rows.map(([k, v]) => `<div><div class="k">${esc(k)}</div><div class="v">${v}</div></div>`).join('')
+  }</div></div>`;
+}
+
+function ledgerCard(ov) {
+  const rows = ov.recentLedger.map((r) => `<tr>
+    <td>${esc(r.date)}</td>
+    <td>${r.pendingRepair}</td>
+    <td>${r.returnedToday}</td>
+    <td>${r.recordedAvailable}</td>
+    <td>${r.actualAvailable}</td>
+    <td>${r.recordGap > 0 ? `<span class="pill warn">${r.recordGap}</span>` : '0'}</td>
+    <td class="l">${r.lateAirframeIds.length ? esc(r.lateAirframeIds.join(', ')) : '—'}</td>
+  </tr>`).join('');
+  return `<div class="card"><h2>每日台账对齐（近 14 天）</h2>
+    <div class="sub muted">待修=系统可见的停用未还；归还=当日 closedDate；实际可用=总架数−待修−晚到缺口</div>
+    <div class="scroll"><table>
+      <thead><tr><th>日期</th><th>待修</th><th>归还</th><th>系统可用</th><th>实际可用</th><th>晚到缺口</th><th>缺口架号</th></tr></thead>
+      <tbody>${rows}</tbody></table></div></div>`;
+}
+
+function overviewCards(ov) {
+  const gapPill = ov.lateRecordsPending > 0
+    ? `<span class="pill bad">${ov.lateRecordsPending} 单未录入</span>` : '<span class="pill good">无缺口</span>';
+  return kvCard('修订版与数据口径', [
+    ['基准日 asOf', esc(ov.asOf)],
+    ['修订版 revisionId', `<code>${esc(ov.revisionId)}</code>`],
+    ['可见/全部工单', `${ov.visibleEpisodes} / ${ov.totalEpisodes}`],
+    ['晚到工单', gapPill],
+    ['补录状态', ov.backfilled ? '<span class="pill good">已补录</span>' : '<span class="pill warn">原始数据</span>'],
+    ['当日实际可用 / 总架数', `${ov.today.actualAvailable} / ${ov.today.recordedAvailable + ov.today.pendingRepair + ov.today.recordGap}`],
+  ]) + ledgerCard(ov);
+}
+
+function intervalBar(f, fleetMax) {
+  const left = (f.p10 / fleetMax) * 100;
+  const w = ((f.p90 - f.p10) / fleetMax) * 100;
+  const med = (f.p50 / fleetMax) * 100;
+  return `<span class="bar" style="display:inline-block;width:120px">
+    <i style="left:${left}%;width:${w}%"></i><b style="left:${med}%"></b></span>`;
+}
+
+function forecastCard(fc, fleetMax) {
+  const methods = Object.entries(fc.methods).map(([method, m]) => {
+    const open = m.openBatch;
+    const impact = m.openImpact;
+    const rows = m.forecast.map((f, i) => {
+      const pf = m.pointModeForecast[i];
+      return `<tr>
+        <td>${esc(f.date)}</td><td>+${f.horizonDay}</td>
+        <td>${f.p10}</td><td>${f.p50}</td><td>${f.p90}</td>
+        <td>${intervalBar(f, fleetMax)}</td>
+        <td>${pf.p10}–${pf.p90}（宽 ${pf.p90 - pf.p10}）</td>
+      </tr>`;
+    }).join('');
+    const openRows = open.map((o) => `<tr>
+      <td>${esc(o.airframeId)}</td><td class="l">${esc(o.faultType)}</td>
+      <td>${esc(o.groundDate)}</td><td>${o.elapsedDays}</td><td>${o.estimatedRemainingDays}</td>
+    </tr>`).join('');
+    return `<div class="card">
+      <h2>方法：${esc(method)}（revision <code>${esc(m.revisionId)}</code>，${m.runs} 次模拟，λ=${m.lambdaPerDay}/天）</h2>
+      <div class="sub muted">蓝条为 P10–P90 区间，竖线为中位数；末列是把未修好批次按点估计处理后的区间，用于对比。</div>
+      <div class="scroll"><table>
+        <thead><tr><th>日期</th><th>h</th><th>P10</th><th>P50</th><th>P90</th><th>区间</th><th>点模式区间</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>
+      <p>未修好批次对区间宽度的贡献：随机模式总宽 <b>${impact.stochasticWidthSum}</b> 架·天，
+         点模式总宽 <b>${impact.pointWidthSum}</b> 架·天，
+         差值 <span class="pill warn">+${impact.extraWidthFromOpenBatch}</span>（共 ${impact.openCount} 架在修）</p>
+      <h2>仍未修好的架（${open.length}）</h2>
+      <div class="scroll"><table>
+        <thead><tr><th>架号</th><th>故障类型</th><th>停用日</th><th>已停天数</th><th>估计剩余天数</th></tr></thead>
+        <tbody>${openRows || '<tr><td colspan="5" class="l muted">无</td></tr>'}</tbody></table></div>
+    </div>`;
+  }).join('');
+  return `<div class="grid2">${methods}</div>`;
+}
+
+function backtestCard(bt) {
+  const methodRows = Object.entries(bt.methods).map(([method, m]) => {
+    const a = m.aggregate;
+    return `<tr><td class="l">${esc(method)}</td><td>${a.evaluatedCutoffs}</td>
+      <td>${a.mae}</td><td>${a.bias}</td><td>${a.coverage}</td><td>${a.avgWidth}</td></tr>`;
+  }).join('');
+  const traceRows = bt.revisionTrace.map((t) => `<tr>
+    <td>${esc(t.cutoff)}</td><td><code>${esc(t.revisionId)}</code></td><td>${t.visibleEpisodes}</td></tr>`).join('');
+  const failRows = bt.failures.map((f) => `<tr>
+    <td>${esc(f.cutoff)}</td><td>${esc(f.method)}</td><td><span class="pill bad">${esc(f.code)}</span></td>
+    <td class="l">${esc(f.message)}</td><td>${f.visibleEpisodes}</td></tr>`).join('');
+  return `<div class="card"><h2>历史回放（horizon=${bt.horizon} 天，每点 ${bt.runs} 次模拟）</h2>
+    <p class="muted">同一基准日两种方法读取同一修订版：
+      <span class="pill ${bt.sameRevisionForBothMethods ? 'good' : 'bad'}">
+      ${bt.sameRevisionForBothMethods ? 'revisionId 完全一致' : '修订版不一致！'}</span>
+      ；${esc(bt.truthNote)}</p>
+    <div class="grid2">
+      <div><h2>汇总指标（越低越好；coverage 越接近 0.8 越好）</h2>
+        <table><thead><tr><th class="l">方法</th><th>有效基准日</th><th>MAE</th><th>偏差</th><th>P10–P90 覆盖率</th><th>平均区间宽</th></tr></thead>
+        <tbody>${methodRows}</tbody></table></div>
+      <div><h2>修订版轨迹</h2>
+        <div class="scroll"><table><thead><tr><th>基准日</th><th>revisionId</th><th>可见工单数</th></tr></thead>
+        <tbody>${traceRows}</tbody></table></div></div>
+    </div>
+    <h2>异常路径（数据不足被拒绝的基准日）</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>基准日</th><th>方法</th><th>错误码</th><th class="l">信息</th><th>可见工单数</th></tr></thead>
+      <tbody>${failRows || '<tr><td colspan="5" class="l muted">无</td></tr>'}</tbody></table></div>
+  </div>`;
+}
+
+function bind(id, fn) {
+  document.getElementById(id).addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try { await fn(); } catch (err) {
+      setEvidence('error', `<div class="card err"><h2>请求失败</h2><pre>${esc(err.message)}</pre></div>`);
+    } finally { btn.disabled = false; }
+  });
+}
+
+bind('btn-generate', async () => {
+  const ov = await call('/api/generate', { method: 'POST' });
+  setEvidence('generated', `<div class="card"><h2>${esc(ov.message)}</h2></div>` + overviewCards(ov));
+});
+
+bind('btn-backfill', async () => {
+  const ov = await call('/api/backfill', { method: 'POST' });
+  setEvidence('backfilled', `<div class="card"><h2>${esc(ov.message)}</h2>
+    <p class="muted">补录历史：${ov.backfillHistory.map((h) => `${esc(h.at.slice(11, 19))} 补 ${h.applied} 单`).join('；') || '无'}</p></div>`
+    + overviewCards(ov));
+});
+
+bind('btn-backtest', async () => {
+  const [ov, fc, bt] = await Promise.all([
+    call('/api/state'), call('/api/forecast', { method: 'POST' }), call('/api/backtest'),
+  ]);
+  const fleetMax = ov.totalEpisodes ? (ov.today.recordedAvailable + ov.today.pendingRepair + ov.today.recordGap) : 12;
+  setEvidence('backtest', overviewCards(ov) + forecastCard(fc, fleetMax) + backtestCard(bt));
+});
+</script>
+</body>
+</html>

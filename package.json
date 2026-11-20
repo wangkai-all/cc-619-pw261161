@@ -1,0 +1,14 @@
+{
+  "name": "airframe-readiness-replay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "本地实现：维修工单晚到场景下的可用架数区间预测与历史回放",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
